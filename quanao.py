@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import os
 import pandas as pd
 
-# Import các thư viện SQLAlchemy cần thiết
+# Import các thư viện SQLAlchemy cần thiết (SQLite)
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Text, func
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, joinedload 
 
@@ -48,30 +48,22 @@ class StockMovement(Base):
     product = relationship('Product')
 
 
-# ---------- Database connection (PostgreSQL/Supabase) ----------
+# ---------- Database connection (SQLite) ----------
 
 if not os.path.exists('images'):
     os.makedirs('images')
 
-# Tên key bí mật đơn giản hóa (Đã FIX lỗi Streamlit cache)
-CONNECTION_SECRET_KEY = "DB_CONNECTION_URL"
+DB_PATH = 'sqlite:///shop_db.db' # Đường dẫn đến file SQLite
 
 # Hàm kết nối và tạo engine, dùng cache để chỉ chạy 1 lần
-@st.cache_resource(ttl=3600)
-def get_remote_engine():
-    # 1. Kiểm tra key bí mật đơn giản
-    if CONNECTION_SECRET_KEY not in st.secrets:
-        st.error(f"Lỗi: Không tìm thấy key '{CONNECTION_SECRET_KEY}' trong Streamlit Secrets. Vui lòng kiểm tra lại cấu hình Supabase.")
-        st.stop()
-    
-    # 2. Lấy URL và tạo engine SQLAlchemy
-    db_url = st.secrets[CONNECTION_SECRET_KEY]
+@st.cache_resource(ttl=None) # Giữ engine mãi mãi
+def get_local_engine():
+    # Kết nối SQLite. Check_same_thread=False cần thiết cho SQLite trong môi trường đa luồng
     try:
-        # Sử dụng pool_pre_ping=True để đảm bảo kết nối hoạt động
-        engine = create_engine(db_url, pool_pre_ping=True)
+        engine = create_engine(DB_PATH, connect_args={"check_same_thread": False})
         return engine
     except Exception as e:
-        st.error(f"Lỗi: Không thể tạo Database Engine. Lỗi chi tiết: {e}")
+        st.error(f"Lỗi: Không thể tạo Database Engine SQLite. Lỗi chi tiết: {e}")
         st.stop()
 
 # Hàm này đảm bảo các bảng được tạo khi kết nối lần đầu
@@ -81,14 +73,14 @@ def initialize_database(engine):
         try:
             # Kết nối và tạo các bảng nếu chúng chưa tồn tại
             Base.metadata.create_all(engine)
-            st.success("✅ Kết nối Database thành công và các bảng đã được tạo.")
+            st.success("✅ Kết nối Database SQLite thành công và các bảng đã được tạo.")
         except Exception as e:
             st.error(f"❌ Lỗi khi khởi tạo bảng database: {e}")
             st.stop()
 
 
 # Lấy Engine và khởi tạo DB
-engine = get_remote_engine()
+engine = get_local_engine()
 initialize_database(engine)
 
 # Khởi tạo Session Local
@@ -255,7 +247,7 @@ def create_order(items):
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title='Shop Manager', layout='wide')
-st.title('👗 Shop Manager - PostgreSQL Version')
+st.title('👗 Shop Manager - SQLite Version')
 
 menu = st.sidebar.selectbox('Chức năng', ['Dashboard', 'Sản phẩm', 'Đơn hàng (POS)', 'Nhập kho', 'Thống kê & Báo cáo', 'Xuất dữ liệu'])
 
@@ -273,7 +265,7 @@ if menu == 'Dashboard':
     col2.metric('Tổng đơn hàng', total_orders)
     col3.metric('Tổng tồn kho', total_stock)
     
-    st.caption('Dữ liệu được lưu vĩnh viễn trên PostgreSQL/Supabase.')
+    st.caption('Dữ liệu được lưu trữ cục bộ bằng SQLite.')
 
 # --- Quản lý Sản phẩm ---
 elif menu == 'Sản phẩm':
@@ -668,7 +660,7 @@ elif menu == 'Xuất dữ liệu':
                     'Quantity': item.qty,
                     'Selling Price (per item)': item.price,
                     'Cost Price (per item)': item_cost_price,
-                    'Gross Profit (per item)': item.price - item_cost_price,
+                    'Gross Profit (per item)': item.price - item.cost_price,
                     'Total Order Value': o.total
                 })
         df_orders_export = pd.DataFrame(order_data)

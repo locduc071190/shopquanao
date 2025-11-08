@@ -1,5 +1,3 @@
 streamlit
 pandas
-numpy
-SQLAlchemy
-psycopg2-binary 
+sqlalchemy
