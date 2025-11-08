@@ -5,159 +5,196 @@ import os
 import uuid
 import numpy as np 
 from io import BytesIO
+from sqlalchemy import text, inspect
+from sqlalchemy.exc import ProgrammingError
 
-# --- Sheet Names and Constants ---
-SHEET_PRODUCTS = 'products'
-SHEET_ORDERS = 'orders'
-SHEET_ORDER_ITEMS = 'order_items'
-SHEET_STOCK_MOVEMENTS = 'stock_movements'
+# --- Table Names and Constants (SQL) ---
+TABLE_PRODUCTS = 'products'
+TABLE_ORDERS = 'orders'
+TABLE_ORDER_ITEMS = 'order_items'
+TABLE_STOCK_MOVEMENTS = 'stock_movements'
+CONNECTION_NAME = 'shop_db' # Phải khớp với [connections.shop_db] trong secrets.toml
 
-# ---------- GOOGLE SHEETS CONNECTION & DATA LOADING ----------
+# ---------- POSTGRESQL CONNECTION & DATA INITIALIZATION ----------
 
-# NEW: Kết nối Google Sheets, sử dụng st.cache_resource để chỉ kết nối 1 lần
 @st.cache_resource(ttl=3600)
-def get_gheets_connection():
-    # Sử dụng st.secrets["spreadsheet_url"] đã cấu hình trong .streamlit/secrets.toml
-    if "spreadsheet_url" not in st.secrets:
-        st.error("Lỗi: Không tìm thấy 'spreadsheet_url' trong file .streamlit/secrets.toml. Vui lòng kiểm tra lại cấu hình.")
+def get_sql_connection():
+    # Kiểm tra cấu hình kết nối SQL trong secrets.toml
+    if f"connections.{CONNECTION_NAME}" not in st.secrets:
+        st.error(f"Lỗi: Không tìm thấy cấu hình '[connections.{CONNECTION_NAME}]' trong file .streamlit/secrets.toml. Vui lòng kiểm tra lại cấu hình Supabase URL.")
         st.stop()
     
     try:
-        # Sử dụng API của Streamlit để kết nối Google Sheets
-        # LƯU Ý: Phải đảm bảo requirements.txt có thư viện cần thiết (st-gsheets-connection/streamlit-gsheets/gspread/protobuf)
-        conn = st.connection("gheets", type="google_sheets", url=st.secrets["spreadsheet_url"])
+        # Sử dụng API của Streamlit để kết nối SQL
+        conn = st.connection(CONNECTION_NAME, type='sql')
         return conn
     except Exception as e:
-        st.error(f"Lỗi kết nối Google Sheets. Vui lòng kiểm tra file secrets.toml và quyền chia sẻ Service Account. Lỗi chi tiết: {e}")
+        st.error(f"Lỗi kết nối PostgreSQL. Vui lòng kiểm tra URL, mật khẩu và quyền truy cập database. Lỗi chi tiết: {e}")
         st.stop()
 
-db_conn = get_gheets_connection()
+db_conn = get_sql_connection()
 
-# NEW: Tải dữ liệu từ một Sheet
-@st.cache_data(ttl=5) # Cache 5 giây để tránh quá tải API
-def load_data(sheet_name):
+# Hàm tạo bảng nếu chưa tồn tại (Dùng SQLAlchemy inspect và execute)
+def initialize_database():
     try:
-        # Đọc dữ liệu, bỏ qua các cột trống
-        df = db_conn.read(worksheet=sheet_name)
-        
-        # Bổ sung các cột bị thiếu nếu sheet trống (đảm bảo cấu trúc)
-        required_cols = {
-            SHEET_PRODUCTS: ['id', 'name', 'price', 'cost_price', 'stock', 'image_path', 'notes'],
-            SHEET_ORDERS: ['id', 'created_at', 'total'],
-            SHEET_ORDER_ITEMS: ['id', 'order_id', 'product_id', 'qty', 'price', 'cost_price'],
-            SHEET_STOCK_MOVEMENTS: ['id', 'product_id', 'change', 'reason', 'timestamp']
-        }.get(sheet_name, [])
-        
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = pd.NA
+        with db_conn.session as s:
+            inspector = inspect(db_conn.engine)
+            
+            # 1. Bảng PRODUCTS
+            if TABLE_PRODUCTS not in inspector.get_table_names():
+                st.info(f"Đang tạo bảng '{TABLE_PRODUCTS}'...")
+                s.execute(text(f"""
+                    CREATE TABLE {TABLE_PRODUCTS} (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        price REAL DEFAULT 0,
+                        cost_price REAL DEFAULT 0,
+                        stock INTEGER DEFAULT 0,
+                        image_path TEXT,
+                        notes TEXT
+                    );
+                """))
+            
+            # 2. Bảng ORDERS
+            if TABLE_ORDERS not in inspector.get_table_names():
+                st.info(f"Đang tạo bảng '{TABLE_ORDERS}'...")
+                s.execute(text(f"""
+                    CREATE TABLE {TABLE_ORDERS} (
+                        id TEXT PRIMARY KEY,
+                        created_at TIMESTAMP WITHOUT TIME ZONE,
+                        total REAL DEFAULT 0
+                    );
+                """))
 
-        # Ép kiểu dữ liệu (đảm bảo tính toán chính xác)
-        if sheet_name == SHEET_PRODUCTS:
-            df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0).astype(float)
-            df['cost_price'] = pd.to_numeric(df['cost_price'], errors='coerce').fillna(0).astype(float)
-            df['stock'] = pd.to_numeric(df['stock'], errors='coerce').fillna(0).astype(int)
-        
-        if sheet_name == SHEET_ORDERS:
-            df['total'] = pd.to_numeric(df['total'], errors='coerce').fillna(0).astype(float)
-
-        if sheet_name == SHEET_ORDER_ITEMS:
-            df['qty'] = pd.to_numeric(df['qty'], errors='coerce').fillna(0).astype(int)
-            df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0).astype(float)
-            df['cost_price'] = pd.to_numeric(df['cost_price'], errors='coerce').fillna(0).astype(float)
-
-        return df[required_cols] # Trả về đúng thứ tự cột
-
+            # 3. Bảng ORDER_ITEMS
+            if TABLE_ORDER_ITEMS not in inspector.get_table_names():
+                st.info(f"Đang tạo bảng '{TABLE_ORDER_ITEMS}'...")
+                s.execute(text(f"""
+                    CREATE TABLE {TABLE_ORDER_ITEMS} (
+                        id TEXT PRIMARY KEY,
+                        order_id TEXT REFERENCES {TABLE_ORDERS}(id),
+                        product_id TEXT REFERENCES {TABLE_PRODUCTS}(id),
+                        qty INTEGER DEFAULT 0,
+                        price REAL DEFAULT 0,
+                        cost_price REAL DEFAULT 0
+                    );
+                """))
+                
+            # 4. Bảng STOCK_MOVEMENTS
+            if TABLE_STOCK_MOVEMENTS not in inspector.get_table_names():
+                st.info(f"Đang tạo bảng '{TABLE_STOCK_MOVEMENTS}'...")
+                s.execute(text(f"""
+                    CREATE TABLE {TABLE_STOCK_MOVEMENTS} (
+                        id TEXT PRIMARY KEY,
+                        product_id TEXT REFERENCES {TABLE_PRODUCTS}(id),
+                        change INTEGER DEFAULT 0,
+                        reason TEXT,
+                        timestamp TIMESTAMP WITHOUT TIME ZONE
+                    );
+                """))
+            
+            s.commit()
+    
+    except ProgrammingError as e:
+        # Xử lý lỗi khi bảng đã tồn tại (nếu inspect không hoạt động chính xác)
+        st.info("Database đã được khởi tạo.")
     except Exception as e:
-        st.warning(f"Chưa có dữ liệu trong Sheet '{sheet_name}' hoặc lỗi đọc: {e}. Tạo DataFrame trống.")
-        empty_df = pd.DataFrame(columns=required_cols)
-        return empty_df
+        st.error(f"Lỗi khởi tạo Database: {e}")
+        st.stop()
 
-# NEW: Hàm ghi dữ liệu (Viết lại toàn bộ Sheet)
-def write_data(df, sheet_name):
-    # Sử dụng lock file để tránh race condition khi nhiều người ghi cùng lúc
-    df.fillna('', inplace=True) # Thay thế NaN bằng chuỗi rỗng trước khi ghi
-    db_conn.write(df, worksheet=sheet_name)
-    load_data.clear() # Xóa cache sau khi ghi thành công
+
+# NEW: Tải dữ liệu từ một bảng
+@st.cache_data(ttl=5) # Cache 5 giây
+def load_data(table_name):
+    try:
+        # Sử dụng db_conn.query() để tải dữ liệu vào DataFrame
+        df = db_conn.query(f"SELECT * FROM {table_name};", ttl=5)
+        return df
+    except Exception as e:
+        st.warning(f"Lỗi đọc dữ liệu từ bảng '{table_name}'. Vui lòng kiểm tra lại cấu trúc bảng. Lỗi: {e}")
+        # Trả về DataFrame trống với các cột cần thiết nếu đọc lỗi
+        required_cols = {
+            TABLE_PRODUCTS: ['id', 'name', 'price', 'cost_price', 'stock', 'image_path', 'notes'],
+            TABLE_ORDERS: ['id', 'created_at', 'total'],
+            TABLE_ORDER_ITEMS: ['id', 'order_id', 'product_id', 'qty', 'price', 'cost_price'],
+            TABLE_STOCK_MOVEMENTS: ['id', 'product_id', 'change', 'reason', 'timestamp']
+        }.get(table_name, [])
+        return pd.DataFrame(columns=required_cols)
 
 # NEW: Các hàm tải dữ liệu cụ thể
-@st.cache_data(ttl=5)
 def load_products():
-    return load_data(SHEET_PRODUCTS)
+    return load_data(TABLE_PRODUCTS)
 
-@st.cache_data(ttl=5)
 def load_orders():
-    return load_data(SHEET_ORDERS)
+    return load_data(TABLE_ORDERS)
 
-@st.cache_data(ttl=5)
 def load_order_items():
-    return load_data(SHEET_ORDER_ITEMS)
+    return load_data(TABLE_ORDER_ITEMS)
 
-@st.cache_data(ttl=5)
 def load_stock_movements():
-    return load_data(SHEET_STOCK_MOVEMENTS)
+    return load_data(TABLE_STOCK_MOVEMENTS)
 
 def clear_data_cache():
     """Xóa cache sau khi thực hiện thay đổi vào DB."""
     load_data.clear() 
 
-# ---------- Database Helper Functions (OVERHAULED) ----------
+# ---------- Database Helper Functions (SQL OVERHAUL) ----------
 
 def add_product(name, price, cost_price, stock, notes='', image_file=None):
     
-    # 1. Xử lý ảnh (giữ nguyên logic file system)
     img_path = ''
     if image_file:
         ext = os.path.splitext(image_file.name)[1]
         filename = f"{datetime.utcnow().timestamp():.0f}{ext}"
+        # Đảm bảo thư mục 'images' tồn tại
+        if not os.path.exists('images'):
+            os.makedirs('images')
         save_path = os.path.join('images', filename)
         with open(save_path, 'wb') as f:
             f.write(image_file.read())
         img_path = save_path
     
-    # 2. Tạo record mới
-    df_products = load_products()
     new_product_id = str(uuid.uuid4())
     
-    new_row = pd.DataFrame([{
-        'id': new_product_id,
-        'name': name,
-        'price': price,
-        'cost_price': cost_price,
-        'stock': stock,
-        'image_path': img_path,
-        'notes': notes
-    }])
+    with db_conn.session as s:
+        # 1. Thêm sản phẩm
+        s.execute(text(f"""
+            INSERT INTO {TABLE_PRODUCTS} (id, name, price, cost_price, stock, image_path, notes)
+            VALUES (:id, :name, :price, :cost_price, :stock, :image_path, :notes)
+        """), {
+            'id': new_product_id,
+            'name': name,
+            'price': float(price),
+            'cost_price': float(cost_price),
+            'stock': int(stock),
+            'image_path': img_path,
+            'notes': notes
+        })
+        s.commit()
     
-    df_products = pd.concat([df_products, new_row], ignore_index=True)
-    
-    # 3. Ghi lại products và thêm movement
-    write_data(df_products, SHEET_PRODUCTS)
+    # 2. Thêm movement ban đầu
     add_stock_movement(new_product_id, stock, 'Initial / Import', skip_product_update=True)
-    
+    clear_data_cache()
     return new_product_id, name
 
 def update_product(product_id, name, price, cost_price, notes, image_file=None, remove_image=False):
     
-    df_products = load_products()
-    idx = df_products[df_products['id'] == product_id].index
+    products_df = load_products()
+    p = products_df[products_df['id'] == product_id]
     
-    if idx.empty:
+    if p.empty:
         raise ValueError(f"Sản phẩm id={product_id} không tồn tại")
     
-    # Lấy đường dẫn ảnh cũ
-    p = df_products.loc[idx[0]]
-    old_image_path = p['image_path'] if pd.notna(p['image_path']) else ''
+    old_image_path = p['image_path'].iloc[0] if pd.notna(p['image_path'].iloc[0]) else ''
+    img_path_update = old_image_path # Mặc định giữ nguyên
 
     # 1. Handle image removal
     if remove_image and old_image_path and os.path.exists(old_image_path):
         os.remove(old_image_path)
-        df_products.loc[idx, 'image_path'] = ''
-        old_image_path = '' # Đánh dấu đã xóa
+        img_path_update = '' 
 
     # 2. Handle new image upload
     if image_file:
-        # Delete old image if it exists and hasn't been removed yet
         if old_image_path and os.path.exists(old_image_path):
             os.remove(old_image_path)
             
@@ -166,63 +203,77 @@ def update_product(product_id, name, price, cost_price, notes, image_file=None, 
         save_path = os.path.join('images', filename)
         with open(save_path, 'wb') as f:
             f.write(image_file.read())
-        df_products.loc[idx, 'image_path'] = save_path
+        img_path_update = save_path
     
     # 3. Update fields
-    df_products.loc[idx, 'name'] = name
-    df_products.loc[idx, 'price'] = price
-    df_products.loc[idx, 'cost_price'] = cost_price
-    df_products.loc[idx, 'notes'] = notes
-            
-    write_data(df_products, SHEET_PRODUCTS)
+    with db_conn.session as s:
+        s.execute(text(f"""
+            UPDATE {TABLE_PRODUCTS}
+            SET name = :name, price = :price, cost_price = :cost_price, 
+                notes = :notes, image_path = :image_path
+            WHERE id = :id
+        """), {
+            'name': name,
+            'price': float(price),
+            'cost_price': float(cost_price),
+            'notes': notes,
+            'image_path': img_path_update,
+            'id': product_id
+        })
+        s.commit()
+    
+    clear_data_cache()
     return product_id, name
 
 def add_stock_movement(product_id, change, reason='manual', skip_product_update=False):
     
-    df_products = load_products()
-    df_movements = load_stock_movements()
+    products_df = load_products()
+    p = products_df[products_df['id'] == product_id]
     
-    idx = df_products[df_products['id'] == product_id].index
-    
-    if idx.empty:
+    if p.empty:
         raise ValueError(f"Sản phẩm id={product_id} không tồn tại")
 
-    # 1. Cập nhật tồn kho (Nếu không bị skip)
-    if not skip_product_update:
-        current_stock = df_products.loc[idx, 'stock'].iloc[0]
-        new_stock = current_stock + change
-        df_products.loc[idx, 'stock'] = new_stock
-        write_data(df_products, SHEET_PRODUCTS) # Ghi lại products
-
-    # 2. Thêm movement
-    new_movement_id = str(uuid.uuid4())
-    new_row = pd.DataFrame([{
-        'id': new_movement_id,
-        'product_id': product_id,
-        'change': change,
-        'reason': reason,
-        'timestamp': datetime.utcnow().isoformat()
-    }])
-    df_movements = pd.concat([df_movements, new_row], ignore_index=True)
-    write_data(df_movements, SHEET_STOCK_MOVEMENTS) # Ghi lại movements
+    current_stock = p['stock'].iloc[0]
+    new_stock = current_stock + change
     
+    with db_conn.session as s:
+        # 1. Cập nhật tồn kho (Nếu không bị skip)
+        if not skip_product_update:
+            s.execute(text(f"""
+                UPDATE {TABLE_PRODUCTS}
+                SET stock = :new_stock
+                WHERE id = :id
+            """), {'new_stock': int(new_stock), 'id': product_id})
+
+        # 2. Thêm movement
+        new_movement_id = str(uuid.uuid4())
+        s.execute(text(f"""
+            INSERT INTO {TABLE_STOCK_MOVEMENTS} (id, product_id, "change", reason, timestamp)
+            VALUES (:id, :product_id, :change, :reason, :timestamp)
+        """), {
+            'id': new_movement_id,
+            'product_id': product_id,
+            'change': int(change),
+            'reason': reason,
+            'timestamp': datetime.utcnow()
+        })
+        s.commit()
+    
+    clear_data_cache()
     return new_movement_id
+
 
 def create_order(items):
     
-    df_products = load_products()
-    df_orders = load_orders()
-    df_order_items = load_order_items()
-    df_movements = load_stock_movements()
-    
+    products_df = load_products()
     total = 0.0
     
-    # 1. Kiểm tra tồn kho và lấy giá
+    # 1. Kiểm tra tồn kho và lấy giá (chỉ cần đọc)
     for it in items:
         product_id = it['product_id']
         qty = it['qty']
         
-        p = df_products[df_products['id'] == product_id]
+        p = products_df[products_df['id'] == product_id]
         if p.empty:
             raise ValueError(f"Sản phẩm id={product_id} không tồn tại")
         
@@ -234,72 +285,78 @@ def create_order(items):
 
     # 2. Tạo Order Header
     new_order_id = str(uuid.uuid4())
-    order_created_at = datetime.utcnow().isoformat()
+    order_created_at = datetime.utcnow()
     
-    # 3. Xử lý items, cập nhật tồn kho và tạo movement
-    order_items_rows = []
-    movement_rows = []
-    
-    for it in items:
-        product_id = it['product_id']
-        qty = it['qty']
+    with db_conn.session as s:
         
-        idx = df_products[df_products['id'] == product_id].index
-        p = df_products.loc[idx[0]]
-        
-        # Cập nhật tồn kho
-        df_products.loc[idx, 'stock'] -= qty
-        
-        # Tạo Order Item
-        new_item_id = str(uuid.uuid4())
-        item_price = p['price']
-        item_cost_price = p['cost_price']
+        # 3. Xử lý items, cập nhật tồn kho và tạo movement (Transaction)
+        for it in items:
+            product_id = it['product_id']
+            qty = it['qty']
+            
+            p = products_df[products_df['id'] == product_id].iloc[0]
+            
+            item_price = p['price']
+            item_cost_price = p['cost_price']
 
-        order_items_rows.append({
-            'id': new_item_id,
-            'order_id': new_order_id,
-            'product_id': product_id,
-            'qty': qty,
-            'price': item_price,
-            'cost_price': item_cost_price
+            # Cập nhật tồn kho (TRỰC TIẾP trong DB)
+            s.execute(text(f"""
+                UPDATE {TABLE_PRODUCTS}
+                SET stock = stock - :qty
+                WHERE id = :product_id
+            """), {'qty': int(qty), 'product_id': product_id})
+
+            # Tạo Order Item
+            new_item_id = str(uuid.uuid4())
+            s.execute(text(f"""
+                INSERT INTO {TABLE_ORDER_ITEMS} (id, order_id, product_id, qty, price, cost_price)
+                VALUES (:id, :order_id, :product_id, :qty, :price, :cost_price)
+            """), {
+                'id': new_item_id,
+                'order_id': new_order_id,
+                'product_id': product_id,
+                'qty': int(qty),
+                'price': float(item_price),
+                'cost_price': float(item_cost_price)
+            })
+            
+            total += item_price * qty
+            
+            # Tạo Stock Movement
+            new_movement_id = str(uuid.uuid4())
+            s.execute(text(f"""
+                INSERT INTO {TABLE_STOCK_MOVEMENTS} (id, product_id, "change", reason, timestamp)
+                VALUES (:id, :product_id, :change, :reason, :timestamp)
+            """), {
+                'id': new_movement_id,
+                'product_id': product_id,
+                'change': -int(qty),
+                'reason': 'Sale',
+                'timestamp': order_created_at
+            })
+
+        # 4. Thêm Order Header
+        s.execute(text(f"""
+            INSERT INTO {TABLE_ORDERS} (id, created_at, total)
+            VALUES (:id, :created_at, :total)
+        """), {
+            'id': new_order_id,
+            'created_at': order_created_at,
+            'total': float(total)
         })
         
-        total += item_price * qty
-        
-        # Tạo Stock Movement
-        new_movement_id = str(uuid.uuid4())
-        movement_rows.append({
-            'id': new_movement_id,
-            'product_id': product_id,
-            'change': -qty,
-            'reason': 'Sale',
-            'timestamp': order_created_at
-        })
+        s.commit() # Commit tất cả các thay đổi cùng một lúc
 
-    # 4. Thêm Order Header vào DataFrame
-    new_order_row = pd.DataFrame([{
-        'id': new_order_id,
-        'created_at': order_created_at,
-        'total': total
-    }])
-    df_orders = pd.concat([df_orders, new_order_row], ignore_index=True)
-    
-    # 5. Thêm Order Items và Stock Movements vào DataFrames
-    df_order_items = pd.concat([df_order_items, pd.DataFrame(order_items_rows)], ignore_index=True)
-    df_movements = pd.concat([df_movements, pd.DataFrame(movement_rows)], ignore_index=True)
-
-    # 6. Ghi lại tất cả DataFrames đã thay đổi
-    write_data(df_products, SHEET_PRODUCTS)
-    write_data(df_orders, SHEET_ORDERS)
-    write_data(df_order_items, SHEET_ORDER_ITEMS)
-    write_data(df_movements, SHEET_STOCK_MOVEMENTS)
-
+    clear_data_cache()
     return new_order_id, total
 
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title='Shop Manager', layout='wide')
-st.title('👗 Shop Manager - Persistent Version (Google Sheets)')
+st.title('👗 Shop Manager - Persistent Version (PostgreSQL)')
+
+# Khởi tạo DB nếu cần (tạo bảng)
+initialize_database()
 
 menu = st.sidebar.selectbox('Chức năng', ['Dashboard', 'Sản phẩm', 'Đơn hàng (POS)', 'Nhập kho', 'Thống kê & Báo cáo', 'Xuất dữ liệu'])
 
@@ -319,7 +376,7 @@ if menu == 'Dashboard':
     col2.metric('Tổng đơn hàng', total_orders)
     col3.metric('Tổng tồn kho', total_stock)
     
-    st.caption('Dữ liệu được làm mới sau mỗi thao tác thêm/sửa/tạo đơn. (Dữ liệu được lưu trên Google Sheets)')
+    st.caption('Dữ liệu được làm mới sau mỗi thao tác thêm/sửa/tạo đơn. (Dữ liệu được lưu trên PostgreSQL)')
 
 elif menu == 'Sản phẩm':
     st.header('📦 Quản lý sản phẩm')
@@ -390,7 +447,6 @@ elif menu == 'Sản phẩm':
                         )
                         st.session_state.editing_product_id = None
                         st.success(f'✅ Đã cập nhật **{product_name}** | ID: **{product_id}**')
-                        clear_data_cache()
                         st.rerun() 
                         
                     except Exception as e:
@@ -423,7 +479,6 @@ elif menu == 'Sản phẩm':
                         product_id, product_name = add_product(name, price, cost_price, int(stock), notes, image_file)
                         
                         st.success(f'✅ Đã thêm **{product_name}** | ID: **{product_id}**')
-                        clear_data_cache()
                         st.rerun() 
                         
                     except Exception as e:
@@ -544,8 +599,8 @@ elif menu == 'Đơn hàng (POS)':
                     
                     order_id, order_total = create_order(order_items_list)
                     
-                    status_placeholder.success(f'🎉 Đã tạo đơn **#{order_id[:8]}** thành công! Tổng cộng: **{order_total:,.0f} VND**. (Dữ liệu được lưu vĩnh viễn trên Google Sheets)')
-                    clear_data_cache()
+                    status_placeholder.success(f'🎉 Đã tạo đơn **#{order_id[:8]}** thành công! Tổng cộng: **{order_total:,.0f} VND**. (Dữ liệu được lưu vĩnh viễn trên PostgreSQL)')
+                    st.rerun() 
                     
             except ValueError as e:
                 status_placeholder.error(f"❌ Lỗi tồn kho: {e}")
@@ -579,7 +634,6 @@ elif menu == 'Nhập kho':
                 try:
                     m_id = add_stock_movement(selected_id, int(change), reason)
                     st.success(f'✅ Đã cập nhật **{change}** đơn vị cho sản phẩm.')
-                    clear_data_cache()
                     st.rerun() 
                 except Exception as e:
                     st.error(f"Lỗi: {e}")
@@ -603,17 +657,19 @@ elif menu == 'Thống kê & Báo cáo':
         # Chuẩn bị dữ liệu cho thống kê (Tạo 1 DataFrame lớn)
         df_merged = pd.merge(order_items_df, orders_df[['id', 'created_at']], 
                              left_on='order_id', right_on='id', suffixes=('_item', '_order'))
-        df_merged = pd.merge(df_merged, products_df[['id', 'name']], 
+        df_merged = pd.merge(df_merged, products_df[['id', 'name', 'cost_price']], 
                              left_on='product_id', right_on='id', suffixes=('_merged', '_product'))
         
         # Đổi tên cột
-        df_merged.rename(columns={'id_order': 'Order ID', 'created_at': 'Ngày tạo', 'name': 'Tên sản phẩm'}, inplace=True)
+        df_merged.rename(columns={'id_order': 'Order ID', 'created_at': 'Ngày tạo', 'name': 'Tên sản phẩm', 'cost_price_product': 'cost_price_product'}, inplace=True)
         
         # Tính toán
         df_merged['Ngày'] = pd.to_datetime(df_merged['Ngày tạo']).dt.date
-        df_merged['Tháng'] = pd.to_datetime(df_merged['Ngày tạo']).dt.strftime('%Y-%m')
         df_merged['Tổng tiền Bán Item'] = df_merged['qty'] * df_merged['price']
-        df_merged['Tổng Vốn Item'] = df_merged['qty'] * df_merged['cost_price']
+        
+        # Lấy giá cost_price từ bảng order_items (đã lưu tại thời điểm bán)
+        df_merged['Tổng Vốn Item'] = df_merged['qty'] * df_merged['cost_price_item']
+        
         df_merged['Lợi nhuận Gộp Item'] = df_merged['Tổng tiền Bán Item'] - df_merged['Tổng Vốn Item']
         
         df_orders = df_merged.copy()
@@ -622,7 +678,7 @@ elif menu == 'Thống kê & Báo cáo':
         with st.expander('📈 1. Tổng quan Doanh thu & Lợi nhuận', expanded=True):
             
             total_orders_count = df_orders['Order ID'].nunique()
-            total_revenue = df_orders.groupby('Order ID')['Tổng tiền Bán Item'].sum().sum()
+            total_revenue = df_orders['Tổng tiền Bán Item'].sum()
             total_gross_profit = df_orders['Lợi nhuận Gộp Item'].sum()
             
             col_a, col_b, col_c = st.columns(3)
@@ -672,7 +728,7 @@ elif menu == 'Thống kê & Báo cáo':
                 Tổng_Lợi_nhuận=('Lợi nhuận Gộp Item', 'sum')
             ).reset_index()
 
-            details_series = df_orders.groupby('Order ID').apply(format_order_details).rename('Chi tiết sản phẩm')
+            details_series = df_orders.groupby('Order ID').apply(format_order_details, include_groups=False).rename('Chi tiết sản phẩm')
             
             order_summary = pd.merge(order_summary, details_series.reset_index(), on='Order ID')
             order_summary.sort_values(by='Ngày tạo', ascending=False, inplace=True)
@@ -691,7 +747,7 @@ elif menu == 'Thống kê & Báo cáo':
 
 elif menu == 'Xuất dữ liệu':
     st.header('💾 Xuất Log & Báo cáo')
-    st.markdown('***(Dữ liệu được tải trực tiếp từ Google Sheets)***')
+    st.markdown('***(Dữ liệu được tải trực tiếp từ PostgreSQL)***')
     
     st.subheader('1. Xuất Log Đơn hàng chi tiết (Orders & Items)')
     
@@ -700,6 +756,7 @@ elif menu == 'Xuất dữ liệu':
     products_df = load_products()
 
     if not orders_df.empty and not order_items_df.empty:
+        # Tái tạo lại logic merge như phần thống kê
         df_orders_export = pd.merge(order_items_df, orders_df[['id', 'created_at', 'total']], 
                                     left_on='order_id', right_on='id', suffixes=('_item', '_order'))
         df_orders_export = pd.merge(df_orders_export, products_df[['id', 'name']], 
@@ -716,11 +773,10 @@ elif menu == 'Xuất dữ liệu':
             'cost_price_item': 'Cost Price (per item)',
         }, inplace=True)
         
-        # Lọc và tính toán lại cho chắc chắn
         df_orders_export['Gross Profit (per item)'] = df_orders_export['Selling Price (per item)'] - df_orders_export['Cost Price (per item)']
         
         cols_to_export = [
-            'Order ID', 'Created At', 'OrderItem ID', 'Product ID', 'Product Name', 
+            'Order ID', 'Created At', 'OrderItem ID', 'product_id', 'Product Name', 
             'Quantity', 'Selling Price (per item)', 'Cost Price (per item)', 
             'Gross Profit (per item)', 'Total Order Value'
         ]
@@ -741,10 +797,11 @@ elif menu == 'Xuất dữ liệu':
     movements_df = load_stock_movements()
     
     if not movements_df.empty:
-        df_movements = pd.merge(movements_df, products_df[['id', 'name', 'stock']], 
+        # Cần JOIN để lấy tên sản phẩm và tồn kho hiện tại (stock)
+        movements_df = pd.merge(movements_df, products_df[['id', 'name', 'stock']], 
                                     left_on='product_id', right_on='id', suffixes=('_mov', '_prod'))
         
-        df_movements.rename(columns={
+        movements_df.rename(columns={
             'id_mov': 'Movement ID',
             'timestamp': 'Timestamp',
             'name': 'Product Name',
@@ -752,16 +809,16 @@ elif menu == 'Xuất dữ liệu':
             'stock': 'Current Stock'
         }, inplace=True)
         
-        cols_to_export = ['Movement ID', 'Timestamp', 'Product ID', 'Product Name', 'Change (+Nhập/-Xuất)', 'Reason', 'Current Stock']
+        cols_to_export = ['Movement ID', 'Timestamp', 'product_id', 'Product Name', 'Change (+Nhập/-Xuất)', 'reason', 'Current Stock']
         
-        csv_movements = df_movements[cols_to_export].to_csv(index=False).encode('utf-8')
+        csv_movements = movements_df[cols_to_export].to_csv(index=False).encode('utf-8')
         st.download_button(
             label="Tải Log Kho (.csv)",
             data=csv_movements,
             file_name='shop_stock_movements_log.csv',
             mime='text/csv',
         )
-        st.success(f"Log Kho ({len(df_movements)} dòng) đã sẵn sàng để tải xuống.")
+        st.success(f"Log Kho ({len(movements_df)} dòng) đã sẵn sàng để tải xuống.")
 
     else:
         st.info('Không có dữ liệu thay đổi kho để xuất.')

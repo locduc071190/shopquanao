@@ -1,5 +1,5 @@
 streamlit
 pandas
-st-gsheets-connection
-gspread
-protobuf
+numpy
+SQLAlchemy
+psycopg2-binary 
