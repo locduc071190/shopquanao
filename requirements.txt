@@ -1,9 +1,4 @@
-<<<<<<< HEAD
 streamlit
 pandas
 streamlit-gsheets
-=======
-streamlit
-pandas
-sqlalchemy
->>>>>>> 58293004b13ae581862c28e623e3c3002a7a8e25
+gsprea
